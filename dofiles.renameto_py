@@ -1,0 +1,231 @@
+#!/usr/bin/python
+
+#
+# Usage:  dofiles.py gen PATH NUMFILES SIZEFILES [dense|thin|FILESIZE]
+# Usage:  dofiles.py mod PATH [SEED1] [SEED2]
+#
+# Whichever of NUMFILES or SIZEFILES is reached first stops the script.
+# As currently built, the average filesize is 1MB.
+# Unless "dense", "thin", or FILESIZE is specified, files are created without any bits:  size is recorded, but on most modern filesystems no data is stored.
+# If "thin" is specified, files are recorded with file sizes from the distribution but are created with 100 bytes.
+# If FILESIZE is specified, all files are created dense at that fixed size.
+# Use ls -l or du --apparent-size to see sizes.
+# The structure is perfectly repeatable as the random number generator is initialized to the sum of the number and total size of files.
+# Vary the ones digit of the total size if you want variation without much change in total output.
+#
+# First argument "mod" rather than "gen" means modify an existing directory tree with times and uid/gid.
+# In that case NUMFILES and SIZEFILES are used as optional seeds for the random number generator.
+#
+# Currently following third-order specs at https://github.com/Komprise/komprise/wiki/Populating-filesystems
+#
+# Current design:
+# 1.  Number of files in each directory is 2/3 chance of uniformly from 0 through 9 and 1/3 chance of exponentially from 10 with mean 30.
+# 2.  Number of subdirectories in each directory is 2/3 chance of uniformly from 0 through 9 and 1/3 chance of exponentially from 10 with mean 30.
+# 3.  Files are last accessed exponentially with mean 30 million seconds (~1 year).
+# 4.  Files are last modified exponentially with mean 5 million seconds (~2 months) before accessed.
+# 5.  File size is log-normal with mean 7 (~1kB) and variance 4, with anything over 1.2GB recomputed and a repeat over 1.2GB allowed.
+# 6.  File extension is drawn from a list of 13 real extensions and 5 bogus extensions with a normal distribution, mean 6 and standard deviation 3, wrapped on the list.
+# 7.  User uid is drawn from a normal distribution with mean 900, sd 100, clipped by clumping at 700 and 1100.
+# 8.  Group gid is drawn from a normal distribution with mean 900, sd 30, clipped by clumping at 800 and 1000.
+# 9.  Directory names are d0-n.
+# 10. File names are f0-n.ext.
+#
+
+import sys
+import os
+import time
+import random
+import signal
+from collections import deque
+
+if len(sys.argv) < 3:
+    print "Usage:  dofiles.py gen|mod directory count size dense|thin|sparse"
+    sys.exit( 0 )
+
+targetFiles = 0         # seeds
+targetSize = 0          # seeds
+fileSize = -1
+
+cmd = sys.argv[1]                   # "gen" or "mod"
+root = sys.argv[2]                  # "/tmp/mounts/201/populate/test1"
+if cmd == "gen":
+    targetFiles = int(sys.argv[3])      # 1000000
+    targetSize = int(sys.argv[4])       # 1000000000000
+    dense = len(sys.argv) > 5 and sys.argv[5] == "dense"     # gen "dense", "sparse" is default
+    thin = len(sys.argv) > 5 and sys.argv[5] == "thin"       # "thin" means 100 byte files, "sparse" means 0
+    try:
+        fileSize = int(sys.argv[5])
+        dense = True
+        print "fileSize %s" % ( fileSize )
+    except:
+        pass
+
+totalDirs = 0
+totalFiles = 0
+totalSize = 0
+
+queue = deque()
+
+now = time.time()
+random.seed( targetFiles + targetSize )
+
+def createDir(dir):
+
+    global totalDirs
+    global totalFiles
+    global totalSize
+    global targetFiles
+    global targetSize
+
+    os.mkdir(dir)
+    totalDirs += 1
+
+    for j in range(span()):
+        name = os.path.join(dir, "f%s" % j)+"."+fileext()
+        size = filesize()
+        f = createFile(name, size)
+        modFile(name)
+        totalFiles += 1
+        totalSize += size
+        if totalFiles % 1000 == 0:
+            print "    %d %dGB" % ( totalFiles, totalSize / 1000000000 )
+        if totalFiles < targetFiles and totalSize < targetSize:
+            continue
+        else:
+            return
+
+    for j in range(span()):
+        queue.append(os.path.join(dir, "d%s" % j))
+
+def walkDir(dir):
+
+    global totalDirs
+    global totalFiles
+    global totalSize
+    global targetFiles
+    global targetSize
+
+    totalDirs += 1
+
+    for i, file in enumerate( os.listdir( dir ) ):
+        name = os.path.join(dir, file)
+        if os.path.isdir(name):
+            queue.append(name)
+            continue
+        modFile(name)
+        totalFiles += 1
+        totalSize += modFile(name)
+        if totalFiles % 1000 == 0:
+            print "    %d %dGB" % ( totalFiles, totalSize / 1000000000 )
+
+def modFile(name):
+    os.utime( name, filetimes() )
+    os.chown( name, fileuid(), filegid() )
+    return os.stat( name ).st_size
+
+def createFile(name, size):
+    return createDenseFile(name, size) if dense else createSparseFile(name, size, thin)
+
+def createDenseFile(name, size):
+    f = open(name, "wb")
+    f.write(os.urandom(size))                    # On my VM on my Mac takes 2 min per GB
+    #f.write(bytearray(random.getrandbits(8) for i in xrange(size)))     # 2.5 times slower than urandom
+    # While size > 0 write random length of 0 and then random byte
+    #f.write("\0"*int(size))                     # Deduped away
+    f.close()
+    return f
+
+def createSparseFile(name, size, thin):
+    f = open(name, "ab")
+    if thin:
+        f.write(os.urandom(100))                # thin means 100 byte files
+    f.truncate(size)
+    f.close()
+    return f
+
+def filesize():
+    size = random.lognormvariate( 7, 4 )
+    if size > 1200000000:
+        size = random.lognormvariate( 7, 4 )
+    if fileSize >= 0:
+        size = fileSize
+    return long( size )
+
+extensions = ( "bogus", "mp3", "ubby", "dubby", "log", "mp4", "jpg", "tar", "tiff", "boxy", "woxy", "doc", "txt", "pst", "ppt", "xls", "tar", "zip" )
+def fileext():
+    r = int( random.gauss( 6, 3 ) )
+    return extensions[ r % len( extensions ) ]
+
+def fileuid():
+    r = int( random.gauss( 900, 100 ) )
+    if r < 700:
+        r = 700
+    if r > 1100:
+        r = 1100
+    return r
+
+def filegid():
+    r = int( random.gauss( 900, 30 ) )
+    if r < 800:
+        r = 800
+    if r > 1000:
+        r = 1000
+    return r
+
+def filetimes():
+    accessed = random.expovariate(1.0/30000000.0)
+    modified = accessed - random.expovariate(1.0/5000000.0)
+    return ( now-accessed, now-modified )
+
+def span():
+    span = random.randint(1, 14)
+    if span > 9:
+        span = 10 + int( random.expovariate(1.0/20.0) )
+    return span
+
+def genFinish( message ):
+    print "%s.  Generated %d %s files of total size %d average %f in %d directories" % ( message, totalFiles, "dense" if dense else "thin" if thin else "zero", totalSize, totalSize/totalFiles, totalDirs )
+    sys.exit( 0 )
+
+def signal_handler_gen( signal, frame ):
+    genFinish( "Interrupted" )
+
+def modFinish( message ):
+    print "%s.  Modified %d files of total size %d in %d directories" % ( message, totalFiles, totalSize, totalDirs )
+    sys.exit( 0 )
+
+def signal_handler_mod( signal, frame ):
+    modFinish( "Interrupted" )
+
+def mod():
+    print "Modifying files in %s" % ( root )
+    queue.append( root )
+    signal.signal( signal.SIGINT, signal_handler_mod )
+    while True:
+        if queue:
+            walkDir( queue.popleft() )
+        else:
+            break
+    modFinish( "Done" )
+
+def gen():
+    print "Generating up to %d %s files up to size %d in %s" % ( targetFiles, "dense" if dense else "thin" if thin else "zero", targetSize, root )
+    queue.append( root )
+    signal.signal( signal.SIGINT, signal_handler_gen )
+    while totalFiles < targetFiles and totalSize < targetSize:
+        if queue:
+            createDir( queue.popleft() )
+        else:
+            break
+    genFinish( "Done" )
+
+def main():
+    if cmd == "gen":
+        gen()
+    elif cmd == "mod":
+        mod()
+    else:
+        usage()
+
+main()
+
