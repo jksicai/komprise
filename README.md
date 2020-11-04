@@ -3,7 +3,7 @@ Useful Komprise Tools for SEs and Komprise Customers
 
 Source of this script is Eric Platt/Komprise Eng
 
-This script is used to generate mutiple files for a lab or testing environment.  
+This script is used to generate multiple files for a lab or testing environment.  
 
 
 The syntax is below.
